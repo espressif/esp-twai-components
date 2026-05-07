@@ -1,0 +1,3 @@
+controller_drivers/esp_twai_mcp2515/test_apps/test_twai_mcp2515:
+  disable:
+    - if: SOC_GPSPI_SUPPORTED != 1

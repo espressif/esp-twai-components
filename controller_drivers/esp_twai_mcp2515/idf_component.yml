@@ -1,0 +1,5 @@
+version: "0.1.0"
+description: MCP2515 device driver that follows the esp_driver_twai API specification.
+dependencies:
+  idf:
+    version: ">=5.5"
