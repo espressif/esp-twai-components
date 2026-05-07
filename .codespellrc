@@ -1,0 +1,6 @@
+[codespell]
+ignore-words-list = crate,ot,ser,fo
+skip = *.bin,*.elf,*.git,.git,*.png,*.jpg,*.svg
+quiet-level = 3
+count =
+write-changes = true
