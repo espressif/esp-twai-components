@@ -2,7 +2,7 @@
 .pytest_cache/
 __pycache__/
 
-# esp-idf build artifacts
+# ESP-IDF build artifacts
 build/
 build_*_*/
 sdkconfig

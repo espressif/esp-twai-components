@@ -1,0 +1,27 @@
+DEFAULT:
+  perform_check: yes
+  allowed_licenses:
+    - Apache-2.0
+  license_for_new_files: Apache-2.0
+  new_notice_c: |
+    /*
+     * SPDX-FileCopyrightText: {years} Espressif Systems (Shanghai) CO LTD
+     *
+     * SPDX-License-Identifier: {license}
+     */
+  new_notice_python: |
+    # SPDX-FileCopyrightText: {years} Espressif Systems (Shanghai) CO LTD
+    # SPDX-License-Identifier: {license}
+  espressif_copyright: "{years} Espressif Systems (Shanghai) CO LTD"
+
+test_apps_and_examples:
+  include:
+    - "controller_drivers/**/test_apps/**"
+    - "controller_drivers/**/examples/**"
+    - "protocol_stacks/**/test_apps/**"
+    - "protocol_stacks/**/examples/**"
+  allowed_licenses:
+    - Apache-2.0
+    - Unlicense
+    - CC0-1.0
+  license_for_new_files: Unlicense OR CC0-1.0

@@ -1,0 +1,69 @@
+repos:
+  # Core file integrity hooks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+        description: Replace line endings with UNIX 'lf'
+      - id: check-yaml
+      - id: check-json
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+      - id: check-executables-have-shebangs
+      - id: check-shebang-scripts-are-executable
+      - id: detect-private-key
+      - id: check-case-conflict
+      - id: check-symlinks
+      - id: destroyed-symlinks
+
+  # C/C++ code formatting (ESP-IDF standard)
+  - repo: https://github.com/espressif/astyle_py.git
+    rev: v1.1.0
+    hooks:
+      - id: astyle_py
+        args: ["--rules=tools/ci/astyle-rules.yml"]
+        types_or: [c, c++]
+
+  # ESP-IDF specific hooks
+  - repo: https://github.com/espressif/idf-ci
+    rev: v1.1.0
+    hooks:
+      - id: check-tests-missing-config
+
+  - repo: https://github.com/espressif/esp-idf-kconfig.git
+    rev: v3.8.1
+    hooks:
+      - id: check-kconfig-files
+      - id: check-deprecated-kconfig-options
+
+  # Copyright header check
+  - repo: https://github.com/espressif/check-copyright.git
+    rev: v1.1.2
+    hooks:
+      - id: check-copyright
+        args: ["--config", "check_copyright_config.yaml"]
+
+  # Shell script linting
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.10.0.1
+    hooks:
+      - id: shellcheck
+        args: ["--severity=warning"]
+
+  # Python code quality
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.6
+    hooks:
+      - id: ruff
+        args: ["--fix", "--exit-non-zero-on-fix"]
+      - id: ruff-format
+
+  # Spell checking for documentation
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.1
+    hooks:
+      - id: codespell
