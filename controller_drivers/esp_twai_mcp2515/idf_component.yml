@@ -1,5 +1,8 @@
 version: "0.1.0"
 description: MCP2515 device driver that follows the esp_driver_twai API specification.
+url: https://github.com/espressif/esp-twai-components/tree/main/controller_drivers/esp_twai_mcp2515
+repository: https://github.com/espressif/esp-twai-components.git
+issues: https://github.com/espressif/esp-twai-components/issues
 dependencies:
   idf:
     version: ">=5.5"

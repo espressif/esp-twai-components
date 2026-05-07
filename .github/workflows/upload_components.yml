@@ -1,0 +1,267 @@
+name: Push Components to Component Registry
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Run validation only (ignored when force_upload is true)'
+        type: boolean
+        default: true
+      force_upload:
+        description: 'Force upload even if not on main branch'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('ref-{0}', github.ref) }}
+  cancel-in-progress: true
+
+env:
+  COMPONENT_NAMESPACE: ${{ vars.COMPONENT_NAMESPACE || 'espressif' }}
+
+jobs:
+  discover-components:
+    name: Discover Components
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      components: ${{ steps.discover.outputs.components }}
+      component_count: ${{ steps.discover.outputs.component_count }}
+      should_validate: ${{ steps.mode.outputs.should_validate }}
+      should_publish: ${{ steps.mode.outputs.should_publish }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: 'recursive'
+
+      - name: Discover components
+        id: discover
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          COMPONENTS=()
+          COMPONENTS_FILE="$RUNNER_TEMP/components.txt"
+
+          while IFS= read -r dir; do
+            # Skip components under test_apps or examples directories
+            if echo "$dir" | grep -qE '/(test_apps|examples)(/|$)'; then
+              continue
+            fi
+
+            # Remove leading ./
+            dir_clean="${dir#./}"
+            COMPONENTS+=("$dir_clean")
+          done < <(find . -name "idf_component.yml" -not -path "./.git/*" -exec dirname {} \; | sort)
+
+          COMPONENT_COUNT=${#COMPONENTS[@]}
+          # Ensure COMPONENT_COUNT is valid before exporting outputs.
+          if [[ ! "$COMPONENT_COUNT" =~ ^[0-9]+$ ]]; then
+            COMPONENT_COUNT=0
+          fi
+          # Output components as newline-separated list
+          : > "$COMPONENTS_FILE"
+          if [[ $COMPONENT_COUNT -gt 0 ]]; then
+            printf '%s\n' "${COMPONENTS[@]}" > "$COMPONENTS_FILE"
+          fi
+
+          {
+            echo "components<<EOF"
+            cat "$COMPONENTS_FILE"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "component_count=$COMPONENT_COUNT" >> "$GITHUB_OUTPUT"
+
+          echo "Found $COMPONENT_COUNT component(s):"
+          if [[ $COMPONENT_COUNT -gt 0 ]]; then
+            cat "$COMPONENTS_FILE"
+          fi
+
+      - name: Determine upload mode
+        id: mode
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SHOULD_VALIDATE=false
+          SHOULD_PUBLISH=false
+          MODE_REASON="No matching trigger mode."
+
+          EVENT_NAME="${{ github.event_name }}"
+          REF_NAME="${{ github.ref_name }}"
+          REPOSITORY_OWNER="${{ github.repository_owner }}"
+          INPUT_FORCE_UPLOAD="${{ github.event.inputs.force_upload }}"
+
+          case "$EVENT_NAME" in
+            pull_request)
+              SHOULD_VALIDATE=true
+              MODE_REASON="Pull request always runs validation."
+              ;;
+            workflow_dispatch)
+              if [[ "$INPUT_FORCE_UPLOAD" == "true" ]]; then
+                SHOULD_PUBLISH=true
+                MODE_REASON="Manual dispatch requested upload."
+              else
+                SHOULD_VALIDATE=true
+                MODE_REASON="Manual dispatch defaults to validation unless force_upload is enabled."
+              fi
+              ;;
+            push)
+              if [[ "$REF_NAME" == "main" && "$REPOSITORY_OWNER" == "espressif" ]]; then
+                SHOULD_PUBLISH=true
+                MODE_REASON="Push to main in official repository."
+              else
+                MODE_REASON="Push event outside publish policy."
+              fi
+              ;;
+            *)
+              MODE_REASON="Unsupported event type."
+              ;;
+          esac
+
+          {
+            echo "should_validate=$SHOULD_VALIDATE"
+            echo "should_publish=$SHOULD_PUBLISH"
+            echo "mode_reason=$MODE_REASON"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate discovery summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          component_count="${{ steps.discover.outputs.component_count }}"
+
+          {
+            echo "## Component Discovery Summary"
+            echo ""
+            echo "| Parameter | Value |"
+            echo "|-----------|-------|"
+            echo "| **Components Found** | $component_count |"
+            echo "| **Status** | ${{ job.status }} |"
+            echo "| **Reason** | ${{ steps.mode.outputs.mode_reason }} |"
+            echo "| **Should Validate** | ${{ steps.mode.outputs.should_validate }} |"
+            echo "| **Should Publish** | ${{ steps.mode.outputs.should_publish }} |"
+            echo "| **Event** | ${{ github.event_name }} |"
+            echo "| **Branch** | ${{ github.ref_name }} |"
+            echo ""
+            if [[ "$component_count" -gt 0 ]]; then
+              echo "### Components"
+              echo ""
+              echo '```'
+              echo "${{ steps.discover.outputs.components }}"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  validate-components:
+    name: Validate Components
+    needs: discover-components
+    if: needs.discover-components.outputs.component_count != '0' && needs.discover-components.outputs.should_validate == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: 'recursive'
+
+      - name: Validate components with dry-run
+        uses: espressif/upload-components-ci-action@v2
+        with:
+          components: ${{ needs.discover-components.outputs.components }}
+          namespace: ${{ env.COMPONENT_NAMESPACE }}
+          dry_run: true
+          skip_pre_release: true
+
+      - name: Generate validation summary
+        if: always()
+        run: |
+          set -euo pipefail
+
+          STATUS="${{ job.status }}"
+          ICON="❓"
+          if [[ "$STATUS" == "success" ]]; then
+            ICON="✅"
+          elif [[ "$STATUS" == "failure" ]]; then
+            ICON="❌"
+          elif [[ "$STATUS" == "cancelled" ]]; then
+            ICON="⛔"
+          fi
+
+          {
+            echo "## Component Validation Summary $ICON"
+            echo ""
+            echo "| Parameter | Value |"
+            echo "|-----------|-------|"
+            echo "| **Components** | ${{ needs.discover-components.outputs.component_count }} |"
+            echo "| **Mode** | Dry-run (validation) |"
+            echo "| **Namespace** | ${{ env.COMPONENT_NAMESPACE }} |"
+            echo "| **Branch** | ${{ github.ref_name }} |"
+            echo "| **Commit** | ${{ github.sha }} |"
+            echo "| **Status** | \`$STATUS\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish-components:
+    name: Publish Components
+    needs: discover-components
+    if: needs.discover-components.outputs.component_count != '0' && needs.discover-components.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: 'recursive'
+
+      - name: Upload components to component service
+        uses: espressif/upload-components-ci-action@v2
+        with:
+          components: ${{ needs.discover-components.outputs.components }}
+          namespace: ${{ env.COMPONENT_NAMESPACE }}
+          dry_run: false
+          skip_pre_release: true
+
+      - name: Generate publish summary
+        if: always()
+        run: |
+          set -euo pipefail
+
+          STATUS="${{ job.status }}"
+          ICON="❓"
+          if [[ "$STATUS" == "success" ]]; then
+            ICON="✅"
+          elif [[ "$STATUS" == "failure" ]]; then
+            ICON="❌"
+          elif [[ "$STATUS" == "cancelled" ]]; then
+            ICON="⛔"
+          fi
+
+          {
+            echo "## Component Publish Summary $ICON"
+            echo ""
+            echo "| Parameter | Value |"
+            echo "|-----------|-------|"
+            echo "| **Components** | ${{ needs.discover-components.outputs.component_count }} |"
+            echo "| **Mode** | Upload to registry |"
+            echo "| **Namespace** | ${{ env.COMPONENT_NAMESPACE }} |"
+            echo "| **Branch** | ${{ github.ref_name }} |"
+            echo "| **Commit** | ${{ github.sha }} |"
+            echo "| **Status** | \`$STATUS\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
