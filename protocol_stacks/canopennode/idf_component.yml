@@ -1,0 +1,7 @@
+version: "0.1.0"
+description: CANopenNode protocol implementation for ESP-IDF
+url: https://github.com/espressif/esp-twai-components/tree/main/protocol_stacks/canopennode
+repository: https://github.com/espressif/esp-twai-components.git
+issues: https://github.com/espressif/esp-twai-components/issues
+dependencies:
+  idf: ">=5.5.4"

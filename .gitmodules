@@ -1,0 +1,3 @@
+[submodule "CANopenNode"]
+	path = protocol_stacks/canopennode/CANopenNode
+	url = https://github.com/CANopenNode/CANopenNode.git

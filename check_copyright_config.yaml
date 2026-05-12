@@ -25,3 +25,10 @@ test_apps_and_examples:
     - Unlicense
     - CC0-1.0
   license_for_new_files: Unlicense OR CC0-1.0
+
+# files matching this section do not perform the check
+# file patterns starting with ! are negated, meaning files matching them won't match the section.
+ignore:
+  perform_check: no
+  include:
+    - protocol_stacks/canopennode/examples/**/OD.*
