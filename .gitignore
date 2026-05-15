@@ -13,6 +13,12 @@ build_summary_*.xml
 app_info_*.txt
 size_info_*.txt
 
+# Documentation build artifacts
+docs_build_output/
+doxygen_output/
+**/docs/book/
+**/docs/doxygen/
+
 # pytest-embedded log folder
 pytest_embedded_log/
 

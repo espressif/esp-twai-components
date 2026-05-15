@@ -3,6 +3,7 @@ description: MCP2515 device driver that follows the esp_driver_twai API specific
 url: https://github.com/espressif/esp-twai-components/tree/main/controller_drivers/esp_twai_mcp2515
 repository: https://github.com/espressif/esp-twai-components.git
 issues: https://github.com/espressif/esp-twai-components/issues
+documentation: https://espressif.github.io/esp-twai-components/latest/controller_drivers/esp_twai_mcp2515/index.html
 dependencies:
   idf:
     version: ">=5.5"
