@@ -1,0 +1,8 @@
+[book]
+title = "MCP2515 Programming Guide"
+language = "en"
+
+[output.html]
+default-theme = "light"
+git-repository-url = "https://github.com/espressif/esp-twai-components/tree/main/controller_drivers/esp_twai_mcp2515"
+edit-url-template = "https://github.com/espressif/esp-twai-components/edit/main/controller_drivers/esp_twai_mcp2515/docs/{path}"
