@@ -1,0 +1,258 @@
+name: Build Apps
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+  workflow_dispatch:
+    inputs:
+      idf_ver:
+        description: 'ESP-IDF version to build'
+        required: false
+        default: 'release-v5.5,latest'
+      force_build_all:
+        description: 'Force build all apps (ignore changed files detection)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('ref-{0}', github.ref) }}
+  cancel-in-progress: true
+
+jobs:
+  discover-apps:
+    name: Discover Buildable Apps
+    runs-on: ubuntu-latest
+    container: espressif/idf:latest
+    timeout-minutes: 20
+    outputs:
+      apps_json: ${{ steps.discover.outputs.apps_json }}
+      has_apps: ${{ steps.discover.outputs.has_apps }}
+      app_count: ${{ steps.discover.outputs.app_count }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: 'recursive'
+
+      - name: Discover apps
+        id: discover
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          . "${IDF_PATH}/export.sh"
+          pip install --quiet --upgrade idf-ci
+
+          # Find all buildable apps
+          COLLECT_OUTPUT=$(idf-ci build collect --paths . --format json 2>/dev/null || echo '{"projects":{}}')
+
+          # Extract app paths from the JSON output
+          APP_PATHS=$(echo "$COLLECT_OUTPUT" | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          apps = []
+          for project_path, project_data in data.get('projects', {}).items():
+              for app in project_data.get('apps', []):
+                  if app.get('build_status') == 'should be built':
+                      apps.append(project_path)
+          print(';'.join(sorted(set(apps))))
+          " 2>/dev/null || echo "")
+
+          APP_COUNT=$(echo "$APP_PATHS" | tr ';' '\n' | grep -c . || echo "0")
+          echo "Discovered ${APP_COUNT} app(s): ${APP_PATHS}"
+
+          echo "apps_json=${APP_PATHS}" >> "$GITHUB_OUTPUT"
+          echo "app_count=${APP_COUNT}" >> "$GITHUB_OUTPUT"
+
+          if [ -n "${APP_PATHS}" ]; then
+            echo "has_apps=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_apps=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate discovery summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## App Discovery Summary"
+            echo ""
+            echo "| Parameter | Value |"
+            echo "|-----------|-------|"
+            echo "| **Apps Discovered** | ${{ steps.discover.outputs.app_count }} |"
+            echo "| **Status** | ${{ job.status }} |"
+            echo "| **Event** | ${{ github.event_name }} |"
+            echo "| **Branch** | ${{ github.ref_name }} |"
+            echo "| **Commit** | ${{ github.sha }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  get-changed-files:
+    name: Detect Changed Files
+    needs: discover-apps
+    if: needs.discover-apps.outputs.has_apps == 'true' && (github.event_name != 'workflow_dispatch' || github.event.inputs.force_build_all != 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      all_changed_files: ${{ steps.changed-files.outputs.all_changed_files }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v47
+        with:
+          separator: ';'
+          safe_output: false
+          files: |
+            **.c
+            **.h
+            **CMakeLists.txt
+            **idf_component.yml
+            **sdkconfig*
+
+  build:
+    needs: [discover-apps, get-changed-files]
+    if: always() && needs.discover-apps.outputs.has_apps == 'true'
+    name: Build (ESP-IDF ${{ matrix.idf_ver }})
+    strategy:
+      fail-fast: false
+      matrix:
+        idf_ver:
+          - release-v5.5
+          - latest
+    runs-on: ubuntu-latest
+    container: espressif/idf:${{ matrix.idf_ver }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: 'recursive'
+
+      - name: Build apps
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "${IDF_PATH}/export.sh"
+
+          pip install --quiet --upgrade idf-ci
+
+          MODIFIED_FILES_ARGS=()
+          if [[ "${{ github.event_name }}" != "workflow_dispatch" && -n "${{ needs.get-changed-files.outputs.all_changed_files }}" ]]; then
+            MODIFIED_FILES_ARGS=("--modified-files" "${{ needs.get-changed-files.outputs.all_changed_files }}")
+          fi
+
+          echo "Building apps with ESP-IDF ${{ matrix.idf_ver }}..."
+
+          # Build all discovered apps
+          idf-ci build run \
+            --paths ${{ needs.discover-apps.outputs.apps_json }} \
+            --target all \
+            "${MODIFIED_FILES_ARGS[@]}"
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts-${{ matrix.idf_ver }}-${{ github.run_id }}
+          path: |
+            **/build_esp*/**/*.bin
+            **/build_esp*/**/*.elf
+            **/build_esp*/**/sdkconfig
+            **/build_esp*/**/sdkconfig.json
+            **/build_esp*/**/flasher_args.json
+            **/build_esp*/**/project_description.json
+            app_info_*.txt
+          retention-days: 30
+          compression-level: 6
+          overwrite: true
+
+      - name: Generate build step summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          STATUS="${{ job.status }}"
+          ICON="❓"
+          if [[ "$STATUS" == "success" ]]; then
+            ICON="✅"
+          elif [[ "$STATUS" == "failure" ]]; then
+            ICON="❌"
+          elif [[ "$STATUS" == "cancelled" ]]; then
+            ICON="⛔"
+          fi
+
+          {
+            echo "## Build Summary $ICON (ESP-IDF ${{ matrix.idf_ver }})"
+            echo ""
+            echo "| Parameter | Value |"
+            echo "|-----------|-------|"
+            echo "| **Apps** | ${{ needs.discover-apps.outputs.app_count }} |"
+            echo "| **ESP-IDF** | ${{ matrix.idf_ver }} |"
+            echo "| **Trigger** | ${{ github.event_name }} |"
+            echo "| **Branch** | ${{ github.ref_name }} |"
+            echo "| **Commit** | ${{ github.sha }} |"
+            echo "| **Status** | \`$STATUS\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build-summary:
+    name: Build Summary
+    needs: [discover-apps, build]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Generate workflow summary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DISCOVER_STATUS="${{ needs.discover-apps.result }}"
+          BUILD_STATUS="${{ needs.build.result }}"
+
+          DISCOVER_ICON="❓"
+          if [[ "$DISCOVER_STATUS" == "success" ]]; then
+            DISCOVER_ICON="✅"
+          elif [[ "$DISCOVER_STATUS" == "failure" ]]; then
+            DISCOVER_ICON="❌"
+          elif [[ "$DISCOVER_STATUS" == "cancelled" ]]; then
+            DISCOVER_ICON="⛔"
+          fi
+
+          BUILD_ICON="❓"
+          if [[ "$BUILD_STATUS" == "success" ]]; then
+            BUILD_ICON="✅"
+          elif [[ "$BUILD_STATUS" == "failure" ]]; then
+            BUILD_ICON="❌"
+          elif [[ "$BUILD_STATUS" == "cancelled" ]]; then
+            BUILD_ICON="⛔"
+          fi
+
+          {
+            echo "## Build Workflow Summary"
+            echo ""
+            echo "| Stage | Status |"
+            echo "|-------|--------|"
+            echo "| **App Discovery** | $DISCOVER_ICON \`$DISCOVER_STATUS\` |"
+            echo "| **Build** | $BUILD_ICON \`$BUILD_STATUS\` |"
+            echo ""
+            echo "| Parameter | Value |"
+            echo "|-----------|-------|"
+            echo "| **Apps Discovered** | ${{ needs.discover-apps.outputs.app_count }} |"
+            echo "| **Trigger** | ${{ github.event_name }} |"
+            echo "| **Branch** | ${{ github.ref_name }} |"
+            echo "| **Commit** | ${{ github.sha }} |"
+            echo "| **Actor** | ${{ github.actor }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
