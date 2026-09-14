@@ -1,326 +1,286 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Espressif Systems (Shanghai) CO LTD
 # SPDX-License-Identifier: Apache-2.0
-"""Build mdBook docs for components that provide docs/book.toml."""
-
-from __future__ import annotations
+"""Build and collect the mdBook documentation for all components."""
 
 import argparse
 import logging
 import os
-import pathlib
+import shlex
 import shutil
 import subprocess
 import sys
-from contextlib import contextmanager
+import tomllib
 from dataclasses import dataclass
+from pathlib import Path
 
 logger = logging.getLogger("build_docs")
 
 
-@dataclass
+class BuildError(RuntimeError):
+    """Raised when an external documentation build step fails."""
+
+
+@dataclass(frozen=True)
 class BuildConfig:
-    repo_root: pathlib.Path
-    output_dir: pathlib.Path
+    repo_root: Path
+    output_dir: Path
     version: str = "latest"
-    fail_fast: bool = True
+    fail_fast: bool = False
 
 
-@contextmanager
-def change_directory(path: pathlib.Path):
-    original = pathlib.Path.cwd()
+def read_text(path: Path) -> str:
     try:
-        os.chdir(path)
-        yield
-    finally:
-        os.chdir(original)
+        return path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise BuildError(f"Unable to read {path}: {error}") from error
 
 
-def _repo_name() -> str:
-    return os.environ.get("GITHUB_REPOSITORY", "espressif/esp-twai-components").split(
-        "/"
-    )[-1]
+def load_book_config(path: Path) -> dict:
+    try:
+        return tomllib.loads(read_text(path))
+    except tomllib.TOMLDecodeError as error:
+        raise BuildError(f"Invalid TOML in {path}: {error}") from error
 
 
-def find_components_with_docs(repo_root: pathlib.Path) -> list[pathlib.Path]:
-    """Search the repo for component folders that have docs/book.toml."""
-    components: list[pathlib.Path] = []
-    for book_toml in sorted(repo_root.glob("**/docs/book.toml")):
-        component_dir = book_toml.parent.parent
-        components.append(component_dir)
-        logger.info(
-            "Found component with docs: %s", component_dir.relative_to(repo_root)
-        )
+def component_books(repo_root: Path) -> list[Path]:
+    """Return component directories containing a docs/book.toml file."""
+    components = sorted(
+        book_toml.parent.parent for book_toml in repo_root.glob("**/docs/book.toml")
+    )
+    for component in components:
+        logger.info("Found documentation: %s", component.relative_to(repo_root))
     return components
 
 
-def run_cmd(
-    cmd: list[str],
-    cwd: pathlib.Path | None = None,
-    check: bool = True,
-    env: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess:
-    if cwd is None:
-        cwd = pathlib.Path.cwd()
-    logger.debug("Running: %s (cwd=%s)", " ".join(cmd), cwd)
-    return subprocess.run(
-        cmd, cwd=str(cwd), check=check, text=True, capture_output=True, env=env
-    )
+def preprocessor_commands(book_toml: Path) -> list[str]:
+    """Extract executable names from all mdBook preprocessor commands."""
+    preprocessors = load_book_config(book_toml).get("preprocessor", {})
+    if not isinstance(preprocessors, dict):
+        raise BuildError(f"Invalid [preprocessor] section in {book_toml}")
 
-
-def parse_doxyfile_settings(doxyfile: pathlib.Path) -> dict[str, str]:
-    """Parse simple key=value settings from Doxyfile."""
-    settings: dict[str, str] = {}
-    for raw_line in doxyfile.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.split("#", 1)[0].strip()
-        if not key:
-            continue
-        if value.startswith('"') and value.endswith('"'):
-            value = value[1:-1]
-        settings[key] = value
-    return settings
-
-
-def resolve_doxygen_xml_dir(
-    docs_dir: pathlib.Path, doxyfile: pathlib.Path
-) -> pathlib.Path | None:
-    """Resolve XML output path from Doxyfile settings."""
-    settings = parse_doxyfile_settings(doxyfile)
-    generate_xml = settings.get("GENERATE_XML", "YES").upper()
-    if generate_xml == "NO":
-        logger.warning("Doxyfile disables GENERATE_XML in %s", docs_dir)
-        return None
-
-    output_dir = settings.get("OUTPUT_DIRECTORY", "").strip()
-    xml_output = settings.get("XML_OUTPUT", "xml").strip() or "xml"
-
-    base_dir = docs_dir / output_dir if output_dir else docs_dir
-    return (base_dir / xml_output).resolve()
-
-
-def find_mdbook_preprocessor_commands(repo_root: pathlib.Path) -> set[str]:
-    """Collect mdBook preprocessor commands referenced in docs/book.toml files."""
-    commands: set[str] = set()
-    for book_toml in repo_root.glob("**/docs/book.toml"):
-        for raw_line in book_toml.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line.startswith("command = "):
-                continue
-            command = line.split("=", 1)[1].strip().strip('"').strip("'")
-            if command:
-                commands.add(command)
+    commands: list[str] = []
+    for name, settings in preprocessors.items():
+        if not isinstance(settings, dict):
+            raise BuildError(f"Invalid preprocessor configuration: {name}")
+        # mdBook defaults [preprocessor.foo] to the `mdbook-foo` executable.
+        command = settings.get("command", f"mdbook-{name}")
+        if not isinstance(command, str):
+            raise BuildError(f"Invalid command for preprocessor.{name}")
+        parts = shlex.split(command)
+        if parts:
+            commands.append(parts[0])
     return commands
 
 
-def check_required_tools(
-    repo_root: pathlib.Path, components: list[pathlib.Path]
-) -> bool:
-    """Ensure required external tools are available before building."""
-    required_tools = {"mdbook"}
-    if any((component / "docs" / "Doxyfile").exists() for component in components):
-        required_tools.update({"doxygen", "esp-doxybook"})
+def required_tools(components: list[Path]) -> set[str]:
+    tools = {"mdbook"}
+    for component in components:
+        book_toml = component / "docs" / "book.toml"
+        tools.update(preprocessor_commands(book_toml))
+        if (component / "docs" / "Doxyfile").exists():
+            tools.update({"doxygen", "esp-doxybook"})
+    return tools
 
-    required_tools.update(find_mdbook_preprocessor_commands(repo_root))
 
-    missing = [tool for tool in sorted(required_tools) if shutil.which(tool) is None]
+def check_required_tools(components: list[Path]) -> None:
+    missing = sorted(
+        tool for tool in required_tools(components) if shutil.which(tool) is None
+    )
     if missing:
-        logger.error("Missing required tools: %s", ", ".join(missing))
-        return False
-    return True
+        raise BuildError(
+            "Missing required tools: "
+            + ", ".join(missing)
+            + ". See README.md for installation instructions."
+        )
 
 
-def generate_api_docs(docs_dir: pathlib.Path) -> bool:
-    """Run Doxygen and esp-doxybook to produce api.md."""
+def run(command: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> None:
+    """Run a command and turn failures into a consistently reported error."""
+    logger.info("$ %s", shlex.join(command))
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            env=env,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+    except OSError as error:
+        raise BuildError(f"Unable to run {command[0]}: {error}") from error
+
+    if result.stdout:
+        logger.debug(result.stdout.rstrip())
+    if result.stderr:
+        logger.debug(result.stderr.rstrip())
+    if result.returncode:
+        output = (result.stdout + result.stderr).strip()
+        details = f"\n{output}" if output else ""
+        raise BuildError(
+            f"Command failed with exit code {result.returncode}: "
+            f"{shlex.join(command)}{details}"
+        )
+
+
+def doxy_xml_dir(docs_dir: Path) -> Path | None:
+    """Resolve Doxygen's XML output directory from its configuration."""
     doxyfile = docs_dir / "Doxyfile"
     if not doxyfile.exists():
-        return True
+        return None
 
-    with change_directory(docs_dir):
-        try:
-            run_cmd(["doxygen", "Doxyfile"])
-        except subprocess.CalledProcessError as e:
-            logger.warning("Doxygen failed in %s: %s", docs_dir, e)
-            if e.stdout:
-                logger.warning(e.stdout)
-            if e.stderr:
-                logger.warning(e.stderr)
-            return False
+    settings: dict[str, str] = {}
+    for raw_line in read_text(doxyfile).splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if "=" not in line:
+            continue
+        key, value = (part.strip() for part in line.split("=", 1))
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        settings[key] = value
 
-        xml_dir = resolve_doxygen_xml_dir(docs_dir, doxyfile)
-        if xml_dir is None:
-            return False
+    if settings.get("GENERATE_XML", "YES").upper() == "NO":
+        raise BuildError(f"Doxygen XML generation is disabled in {doxyfile}")
 
-        if not xml_dir.exists():
-            logger.warning("Doxygen XML output not found in %s", docs_dir)
-            return False
-
-        src_dir = docs_dir / "src"
-        src_dir.mkdir(exist_ok=True)
-
-        try:
-            run_cmd(["esp-doxybook", "-i", str(xml_dir), "-o", str(src_dir / "api.md")])
-        except subprocess.CalledProcessError as e:
-            logger.warning("esp-doxybook failed in %s: %s", docs_dir, e)
-            if e.stdout:
-                logger.warning(e.stdout)
-            if e.stderr:
-                logger.warning(e.stderr)
-            return False
-
-    return True
+    output_dir = docs_dir / settings.get("OUTPUT_DIRECTORY", "")
+    return (output_dir / (settings.get("XML_OUTPUT") or "xml")).resolve()
 
 
-def build_component_docs(component_dir: pathlib.Path, config: BuildConfig) -> bool:
-    """Build mdBook documentation for a single component."""
-    docs_dir = component_dir / "docs"
-    rel_component = component_dir.relative_to(config.repo_root)
+def generate_api_docs(docs_dir: Path) -> None:
+    doxyfile = docs_dir / "Doxyfile"
+    if not doxyfile.exists():
+        return
 
-    logger.info("Building docs for %s", rel_component)
+    run(["doxygen", doxyfile.name], cwd=docs_dir)
+    xml_dir = doxy_xml_dir(docs_dir)
+    if xml_dir is None or not xml_dir.exists():
+        raise BuildError(f"Doxygen XML output was not created: {xml_dir}")
 
-    if not generate_api_docs(docs_dir):
-        logger.error("API doc generation failed for %s", rel_component)
-        return False
-
-    env = os.environ.copy()
-    site_url = f"/{_repo_name()}/{config.version}/{rel_component.as_posix()}/"
-    env["MDBOOK_OUTPUT__HTML__SITE_URL"] = site_url
-
-    try:
-        with change_directory(config.repo_root):
-            result = run_cmd(["mdbook", "build", str(docs_dir)], env=env)
-        if result.stdout:
-            logger.debug(result.stdout)
-        if result.stderr:
-            logger.debug(result.stderr)
-    except subprocess.CalledProcessError as e:
-        logger.error("mdbook build failed for %s: %s", rel_component, e)
-        if e.stdout:
-            logger.error(e.stdout)
-        if e.stderr:
-            logger.error(e.stderr)
-        return False
-
-    source_book = docs_dir / "book"
-    if not source_book.exists():
-        logger.error("Missing build output: %s", source_book)
-        return False
-
-    return True
+    api_file = docs_dir / "src" / "api.md"
+    api_file.parent.mkdir(exist_ok=True)
+    run(
+        ["esp-doxybook", "-i", str(xml_dir), "-o", str(api_file)],
+        cwd=docs_dir,
+    )
 
 
-def copy_docs_to_output(component_dir: pathlib.Path, config: BuildConfig) -> bool:
-    """Copy built documentation to the output directory."""
-    rel_component = component_dir.relative_to(config.repo_root)
-    source_book = component_dir / "docs" / "book"
-
-    if not source_book.exists():
-        logger.warning("Source path %s does not exist, skipping copy", source_book)
-        return False
-
-    dest = config.output_dir / rel_component
-    if dest.exists():
-        shutil.rmtree(dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source_book, dest)
-    logger.info("Copied %s docs to %s", rel_component, dest)
-    return True
+def uses_mermaid(book_toml: Path) -> bool:
+    return any(
+        Path(command).name == "mdbook-mermaid"
+        for command in preprocessor_commands(book_toml)
+    )
 
 
-def build_all_docs(config: BuildConfig) -> bool:
-    """Build documentation for all components."""
-    components = find_components_with_docs(config.repo_root)
+def book_output_dir(docs_dir: Path) -> Path:
+    config = load_book_config(docs_dir / "book.toml")
+    build = config.get("build", {})
+    if not isinstance(build, dict):
+        raise BuildError(f"Invalid [build] section in {docs_dir / 'book.toml'}")
+    build_dir = build.get("build-dir", "book")
+    if not isinstance(build_dir, str) or not build_dir:
+        raise BuildError(f"Invalid build.build-dir in {docs_dir / 'book.toml'}")
+    return docs_dir / build_dir
+
+
+def build_component(component: Path, config: BuildConfig) -> Path:
+    docs_dir = component / "docs"
+    relative = component.relative_to(config.repo_root)
+    book_toml = docs_dir / "book.toml"
+    logger.info("Building %s", relative)
+
+    generate_api_docs(docs_dir)
+    if uses_mermaid(book_toml):
+        run(["mdbook-mermaid", "install", str(docs_dir)], cwd=docs_dir)
+
+    environment = os.environ.copy()
+    environment["MDBOOK_OUTPUT__HTML__SITE_URL"] = (
+        f"/{repo_name()}/{config.version}/{relative.as_posix()}/"
+    )
+    run(["mdbook", "build", str(docs_dir)], cwd=config.repo_root, env=environment)
+
+    output = book_output_dir(docs_dir)
+    if not output.is_dir():
+        raise BuildError(f"mdBook output was not created: {output}")
+    return output
+
+
+def repo_name() -> str:
+    return os.environ.get("GITHUB_REPOSITORY", "espressif/esp-twai-components").rsplit(
+        "/", 1
+    )[-1]
+
+
+def copy_docs(source: Path, component: Path, config: BuildConfig) -> None:
+    destination = config.output_dir / component.relative_to(config.repo_root)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, destination, dirs_exist_ok=True)
+    logger.info("Collected %s", destination.relative_to(config.output_dir))
+
+
+def build_all(config: BuildConfig) -> bool:
+    components = component_books(config.repo_root)
     if not components:
-        logger.warning("No component docs found")
+        logger.warning("No component documentation found")
         return True
 
-    if not check_required_tools(config.repo_root, components):
-        return False
+    check_required_tools(components)
+    shutil.rmtree(config.output_dir, ignore_errors=True)
+    config.output_dir.mkdir(parents=True)
 
-    if config.output_dir.exists():
-        shutil.rmtree(config.output_dir)
-    config.output_dir.mkdir(parents=True, exist_ok=True)
-
-    ok = True
+    failures: list[str] = []
     for component in components:
-        if not build_component_docs(component, config):
-            logger.error("Documentation build failed for %s", component.name)
-            ok = False
+        try:
+            output = build_component(component, config)
+            copy_docs(output, component, config)
+        except (BuildError, OSError) as error:
+            name = component.relative_to(config.repo_root).as_posix()
+            failures.append(name)
+            logger.error("Failed to build %s: %s", name, error)
             if config.fail_fast:
-                logger.info("Fail-fast enabled, stopping build")
                 break
-        else:
-            if not copy_docs_to_output(component, config):
-                logger.error("Documentation copy failed for %s", component.name)
-                ok = False
-                if config.fail_fast:
-                    logger.info("Fail-fast enabled, stopping build")
-                    break
 
-    return ok
+    if failures:
+        logger.error("Documentation failures: %s", ", ".join(failures))
+        return False
+    return True
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build component documentation",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument("--version", default="latest", help="Published URL version")
+    parser.add_argument(
+        "--output-dir", default="docs_build_output", help="Collected documentation"
     )
     parser.add_argument(
-        "--version",
-        default="latest",
-        help="Version path prefix for published docs",
+        "--fail-fast", action="store_true", help="Stop after the first component fails"
     )
     parser.add_argument(
-        "--output-dir",
-        default="docs_build_output",
-        help="Directory to collect built docs",
-    )
-    parser.add_argument(
-        "--no-fail-fast",
-        action="store_true",
-        help="Continue building when one component fails",
-    )
-    parser.add_argument(
-        "--verbose",
-        "-v",
-        action="store_true",
-        help="Enable verbose debug output",
+        "--verbose", "-v", action="store_true", help="Enable debug logs"
     )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
+        format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
     )
-
+    root = Path.cwd()
+    output_dir = Path(args.output_dir)
     config = BuildConfig(
-        repo_root=pathlib.Path.cwd(),
-        output_dir=pathlib.Path.cwd() / args.output_dir,
-        version=args.version,
-        fail_fast=not args.no_fail_fast,
+        repo_root=root,
+        output_dir=output_dir if output_dir.is_absolute() else root / output_dir,
+        version=args.version.strip("/"),
+        fail_fast=args.fail_fast,
     )
-
-    logger.info("Building documentation with config:")
-    logger.info("  Output directory: %s", config.output_dir)
-    logger.info("  Version: %s", config.version)
-    logger.info("  Fail fast: %s", config.fail_fast)
-
-    success = build_all_docs(config)
-
-    if success:
-        logger.info("All documentation built successfully")
-        return 0
-    else:
-        logger.error("Documentation build failed")
+    try:
+        return 0 if build_all(config) else 1
+    except (BuildError, OSError) as error:
+        logger.error("Documentation build aborted: %s", error)
         return 1
 
 
