@@ -37,7 +37,11 @@ jobs:
           mdbook-version: "latest"
 
       - name: Install mdbook plugins
-        run: cargo install mdbook-mermaid
+        run: |
+          set -euo pipefail
+          # mdbook-mermaid is a preprocessor: it must stay on PATH so that
+          # build_docs.py can run "mdbook-mermaid install" before "mdbook build".
+          cargo install mdbook-mermaid --locked
 
       - name: Setup Python
         uses: actions/setup-python@v6
@@ -65,7 +69,8 @@ jobs:
               version="latest"
             fi
           fi
-          python3 ./tools/build_docs.py --version "$version" --output-dir docs_build_output --no-fail-fast
+          # The default is to build every component and report all failures at the end.
+          python3 ./tools/build_docs.py --version "$version" --output-dir docs_build_output
 
       - name: Check links
         uses: lycheeverse/lychee-action@v2

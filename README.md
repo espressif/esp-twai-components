@@ -22,4 +22,4 @@ Build all component docs:
 python3 tools/build_docs.py --output-dir docs_build_output
 ```
 
-Output will be generated under `docs_build_output/`.
+The builder discovers every `docs/book.toml`, validates all required tools before starting, builds every component, and reports all failed components at the end. Output will be generated under `docs_build_output/`.
