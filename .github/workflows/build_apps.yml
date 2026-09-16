@@ -11,13 +11,6 @@ on:
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
-  workflow_dispatch:
-    inputs:
-      idf_ver:
-        description: 'ESP-IDF versions as a JSON array, e.g. ["release-v5.4","latest"]'
-        required: false
-        default: '["release-v5.5","latest"]'
-
 permissions:
   contents: read
 
@@ -47,19 +40,21 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 0
+          fetch-depth: 1
+          persist-credentials: false
           submodules: 'recursive'
 
       - name: Set matrix versions
         id: set-matrix
         env:
-          IDF_VERSIONS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.idf_ver || env.DEFAULT_IDF_VERSIONS_JSON }}
+          IDF_VERSIONS: ${{ env.DEFAULT_IDF_VERSIONS_JSON }}
         run: |
           set -euo pipefail
+          delimiter="EOF_$(openssl rand -hex 16)"
           {
-            echo 'idf_versions<<EOF'
+            echo "idf_versions<<$delimiter"
             printf '%s\n' "$IDF_VERSIONS"
-            echo 'EOF'
+            echo "$delimiter"
           } >> "$GITHUB_OUTPUT"
 
       - name: Install idf-ci
@@ -79,42 +74,43 @@ jobs:
           idf-ci build collect --paths . --format json --output "$COLLECT_OUTPUT_FILE"
           app_paths_json=$(python3 tools/ci/discover_buildable_apps.py "$COLLECT_OUTPUT_FILE")
           app_count=$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$app_paths_json")
+          delimiter="EOF_$(openssl rand -hex 16)"
           {
             echo "app_count=${app_count}"
             echo "app_paths_json=${app_paths_json}"
-            echo "app_paths_text<<EOF"
+            echo "app_paths_text<<$delimiter"
             python3 -c 'import json,sys; print("\n".join(json.loads(sys.argv[1])))' "$app_paths_json"
-            echo "EOF"
+            echo "$delimiter"
           } >> "$GITHUB_OUTPUT"
 
       - name: Generate discovery summary
         if: always()
+        env:
+          APP_COUNT: ${{ steps.discover.outputs.app_count }}
+          JOB_STATUS: ${{ job.status }}
+          EVENT_NAME: ${{ github.event_name }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+          COMMIT: ${{ github.sha }}
+          APP_PATHS: ${{ steps.discover.outputs.app_paths_text }}
         run: |
           set -euo pipefail
 
-          {
-            echo "## App Discovery Summary"
-            echo ""
-            echo "| Parameter | Value |"
-            echo "|-----------|-------|"
-            echo "| **Apps Discovered** | ${{ steps.discover.outputs.app_count }} |"
-            echo "| **Status** | ${{ job.status }} |"
-            echo "| **Event** | ${{ github.event_name }} |"
-            echo "| **Branch** | ${{ github.ref_name }} |"
-            echo "| **Commit** | ${{ github.sha }} |"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          if [[ "${{ steps.discover.outputs.app_count }}" != "0" ]]; then
-            {
-              echo ""
-              echo "### Apps to Build"
-              echo ""
-              echo '```'
-              printf '%s\n' "${{ steps.discover.outputs.app_paths_text }}"
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-
+          summary_args=(
+            --output "$GITHUB_STEP_SUMMARY"
+            --title "App Discovery Summary"
+            --row "Apps Discovered" "$APP_COUNT"
+            --row "Status" "$JOB_STATUS"
+            --row "Event" "$EVENT_NAME"
+            --row "Branch" "$BRANCH"
+            --row "Commit" "$COMMIT"
+          )
+          if [[ "$APP_COUNT" != "0" ]]; then
+            summary_args+=(
+              --code-block-title "Apps to Build"
+              --code-block-content "$APP_PATHS"
+            )
           fi
+          python3 tools/ci/write_summary.py "${summary_args[@]}"
 
   build:
     needs: discover-apps
@@ -130,6 +126,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          persist-credentials: false
           submodules: 'recursive'
 
       - name: Install idf-ci
@@ -140,15 +137,17 @@ jobs:
           python3 -c "import importlib.metadata; print(f\"idf-ci {importlib.metadata.version('idf-ci')}, esptool {importlib.metadata.version('esptool')}\")"
 
       - name: Build apps
+        env:
+          IDF_VERSION: ${{ matrix.idf_ver }}
         run: |
           set -euo pipefail
           . "${IDF_PATH}/export.sh"
-          echo "Building all discovered apps from repository root with ESP-IDF ${{ matrix.idf_ver }}..."
+          echo "Building all discovered apps from repository root with ESP-IDF $IDF_VERSION..."
           idf-ci build run --target all
 
       - name: Upload build artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: build-artifacts-${{ matrix.idf_ver }}-${{ github.run_id }}
           if-no-files-found: ignore
@@ -166,10 +165,16 @@ jobs:
 
       - name: Generate build step summary
         if: always()
+        env:
+          STATUS: ${{ job.status }}
+          APP_COUNT: ${{ needs.discover-apps.outputs.app_count }}
+          IDF_VERSION: ${{ matrix.idf_ver }}
+          EVENT_NAME: ${{ github.event_name }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+          COMMIT: ${{ github.sha }}
         run: |
           set -euo pipefail
 
-          STATUS="${{ job.status }}"
           ICON="❓"
           if [[ "$STATUS" == "success" ]]; then
             ICON="✅"
@@ -179,15 +184,12 @@ jobs:
             ICON="⛔"
           fi
 
-          {
-            echo "## Build Summary $ICON (ESP-IDF ${{ matrix.idf_ver }})"
-            echo ""
-            echo "| Parameter | Value |"
-            echo "|-----------|-------|"
-            echo "| **Apps** | ${{ needs.discover-apps.outputs.app_count }} |"
-            echo "| **ESP-IDF** | ${{ matrix.idf_ver }} |"
-            echo "| **Trigger** | ${{ github.event_name }} |"
-            echo "| **Branch** | ${{ github.ref_name }} |"
-            echo "| **Commit** | ${{ github.sha }} |"
-            echo "| **Status** | \`$STATUS\` |"
-          } >> "$GITHUB_STEP_SUMMARY"
+          python3 tools/ci/write_summary.py \
+            --output "$GITHUB_STEP_SUMMARY" \
+            --title "Build Summary $ICON (ESP-IDF $IDF_VERSION)" \
+            --row "Apps" "$APP_COUNT" \
+            --row "ESP-IDF" "$IDF_VERSION" \
+            --row "Trigger" "$EVENT_NAME" \
+            --row "Branch" "$BRANCH" \
+            --row "Commit" "$COMMIT" \
+            --row "Status" "$STATUS"

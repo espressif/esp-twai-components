@@ -30,6 +30,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Setup mdBook
         uses: peaceiris/actions-mdbook@v2
@@ -59,12 +60,16 @@ jobs:
           python3 -m pip install -r tools/requirements-docs.txt
 
       - name: Build docs
+        env:
+          DOCS_VERSION: ${{ github.event.inputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
-          version="${{ github.event.inputs.version || '' }}"
+          version="${DOCS_VERSION:-}"
           if [[ -z "$version" ]]; then
-            if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-              version="pr-preview-${{ github.event.pull_request.number }}"
+            if [[ "$EVENT_NAME" == "pull_request" ]]; then
+              version="pr-preview-${PR_NUMBER}"
             else
               version="latest"
             fi
@@ -101,7 +106,7 @@ jobs:
 
       - name: Upload docs artifact for PR review
         if: github.event_name == 'pull_request'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: docs-preview-pr-${{ github.event.pull_request.number }}
           path: docs_build_output
@@ -110,19 +115,23 @@ jobs:
 
       - name: Generate build summary
         if: always()
+        env:
+          STATUS: ${{ job.status }}
+          EVENT_NAME: ${{ github.event_name }}
+          # For pull requests, ref_name is refs/pull/<number>/merge; head_ref is the source branch.
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+          COMMIT: ${{ github.sha }}
+          ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
-          {
-            echo "## Docs Build Summary"
-            echo ""
-            echo "| Parameter | Value |"
-            echo "|-----------|-------|"
-            echo "| **Status** | ${{ job.status }} |"
-            echo "| **Event** | ${{ github.event_name }} |"
-            echo "| **Branch** | ${{ github.ref_name }} |"
-            echo "| **Commit** | ${{ github.sha }} |"
-            echo "| **By** | ${{ github.actor }} |"
-          } >> "$GITHUB_STEP_SUMMARY"
+          python3 tools/ci/write_summary.py \
+            --output "$GITHUB_STEP_SUMMARY" \
+            --title "Docs Build Summary" \
+            --row "Status" "$STATUS" \
+            --row "Event" "$EVENT_NAME" \
+            --row "Branch" "$BRANCH" \
+            --row "Commit" "$COMMIT" \
+            --row "By" "$ACTOR"
 
   deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository_owner == 'espressif'
@@ -144,14 +153,14 @@ jobs:
         uses: actions/deploy-pages@v4
       - name: Generate deploy summary
         if: always()
+        env:
+          STATUS: ${{ job.status }}
+          PAGE_URL: ${{ steps.deployment.outputs.page_url }}
         run: |
           set -euo pipefail
-          {
-            echo "## Docs Deploy Summary"
-            echo ""
-            echo "| Parameter | Value |"
-            echo "|-----------|-------|"
-            echo "| **Status** | ${{ job.status }} |"
-            echo "| **Environment** | github-pages |"
-            echo "| **URL** | ${{ steps.deployment.outputs.page_url }}latest/ |"
-          } >> "$GITHUB_STEP_SUMMARY"
+          python3 tools/ci/write_summary.py \
+            --output "$GITHUB_STEP_SUMMARY" \
+            --title "Docs Deploy Summary" \
+            --row "Status" "$STATUS" \
+            --row "Environment" "github-pages" \
+            --row "URL" "${PAGE_URL}latest/"
