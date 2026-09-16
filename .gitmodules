@@ -1,3 +1,7 @@
 [submodule "CANopenNode"]
 	path = protocol_stacks/canopennode/CANopenNode
 	url = https://github.com/CANopenNode/CANopenNode.git
+
+[submodule "protocol_stacks/esp_isotp/isotp-c"]
+	path = protocol_stacks/esp_isotp/isotp-c
+	url = https://github.com/SimonCahill/isotp-c

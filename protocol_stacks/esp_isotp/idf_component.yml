@@ -1,0 +1,7 @@
+version: "0.1.2"
+description: ISO-TP (ISO 15765-2) protocol implementation for ESP-IDF
+url: https://github.com/espressif/esp-twai-components/tree/main/protocol_stacks/esp_isotp
+repository: https://github.com/espressif/esp-twai-components.git
+issues: https://github.com/espressif/esp-twai-components/issues
+dependencies:
+  idf: ">=5.5.4"
